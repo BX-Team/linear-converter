@@ -1,0 +1,205 @@
+name: Package
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit to build
+        required: true
+        type: string
+      release:
+        description: Tag of the draft release the files are attached to
+        required: false
+        default: ""
+        type: string
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+
+jobs:
+  linux:
+    name: Linux (${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            deb: amd64
+            os: ubuntu-22.04
+          - arch: aarch64
+            deb: arm64
+            os: ubuntu-22.04-arm
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: package-linux-${{ matrix.arch }}
+
+      - name: Install the packaging tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: Read the version
+        id: version
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "linear-converter") | .version')"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "rpm=${version//-/\~}" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Smoke-test the binary
+        run: target/release/linear-converter --version
+
+      # Small stubs that ask `linear-converter` for candidates on each Tab; deb and rpm install them.
+      - name: Shell completions
+        run: |
+          mkdir -p target/completions
+          COMPLETE=bash target/release/linear-converter > target/completions/linear-converter.bash
+          COMPLETE=zsh target/release/linear-converter > target/completions/_linear-converter
+          COMPLETE=fish target/release/linear-converter > target/completions/linear-converter.fish
+
+      - name: Archive, deb and rpm
+        env:
+          ARCH: ${{ matrix.arch }}
+          DEB: ${{ matrix.deb }}
+          RPM: ${{ steps.version.outputs.rpm }}
+        run: |
+          mkdir -p out
+          tar -C target/release -czf "out/linear-converter-$ARCH-linux.tar.gz" linear-converter
+          cargo deb --no-build --no-strip --output "out/linear-converter-${DEB}.deb"
+          cargo generate-rpm -s "version = \"$RPM\""
+          cp target/generate-rpm/*.rpm "out/linear-converter-${ARCH}.rpm"
+
+      - name: Upload the workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linear-converter-linux-${{ matrix.arch }}
+          path: out/*
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: inputs.release != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release }}
+        run: gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  windows:
+    name: Windows (x86_64)
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: package-windows
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Smoke-test the binary
+        run: target/release/linear-converter.exe --version
+
+      - name: Archive
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Compress-Archive -Path target/release/linear-converter.exe, LICENSE, README.md -DestinationPath out/linear-converter-x86_64-windows.zip
+
+      - name: Upload the workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linear-converter-windows
+          path: out/*
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: inputs.release != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release }}
+        run: gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber
+
+  macos:
+    name: macOS (universal)
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: package-macos
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Universal binary and archive
+        run: |
+          mkdir -p out dist
+          lipo -create -output dist/linear-converter \
+            target/aarch64-apple-darwin/release/linear-converter \
+            target/x86_64-apple-darwin/release/linear-converter
+          dist/linear-converter --version
+          tar -C dist -czf out/linear-converter-macos.tar.gz linear-converter
+
+      - name: Upload the workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: linear-converter-macos
+          path: out/*
+          if-no-files-found: error
+
+      - name: Attach to the release
+        if: inputs.release != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release }}
+        run: gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber

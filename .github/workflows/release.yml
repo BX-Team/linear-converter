@@ -1,0 +1,164 @@
+name: Release
+
+# A release is a pushed `v<semver>` tag on a commit whose Cargo.toml carries that version:
+#   git tag -a v1.0.0 -m "linear-converter 1.0.0" && git push origin v1.0.0
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build again and attach to its release (e.g. v1.0.0)
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Resolve the release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Check that the tag and the manifest agree
+        id: resolve
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$TAG' is not a v<semver> tag"
+            exit 1
+          fi
+          if ! grep -qx "version = \"$version\"" Cargo.toml; then
+            echo "::error::Cargo.toml at $TAG does not carry version $version; bump it before tagging"
+            exit 1
+          fi
+          prerelease=false
+          case "$version" in *-*) prerelease=true ;; esac
+          {
+            echo "tag=$TAG"
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Make sure the draft release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          PRERELEASE: ${{ steps.resolve.outputs.prerelease }}
+        run: |
+          # A rebuild of an existing release keeps its notes; a new tag gets GitHub's generated notes.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+              --prerelease="$PRERELEASE" --title "Linear Converter $VERSION" --generate-notes
+          fi
+
+  test:
+    name: Test the tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          key: release-test
+
+      - name: Test
+        run: cargo test --locked --profile ci
+
+  package:
+    name: Package
+    needs: [prepare, test]
+    permissions:
+      contents: write
+    uses: ./.github/workflows/package.yml
+    with:
+      ref: ${{ needs.prepare.outputs.tag }}
+      release: ${{ needs.prepare.outputs.tag }}
+
+  publish:
+    name: Publish the release
+    needs: [prepare, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          persist-credentials: false
+
+      - name: Verify the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          have="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')"
+          printf 'attached:\n%s\n\n' "$have"
+          missing=0
+          for asset in \
+            linear-converter-x86_64-linux.tar.gz linear-converter-aarch64-linux.tar.gz \
+            linear-converter-amd64.deb linear-converter-arm64.deb \
+            linear-converter-x86_64.rpm linear-converter-aarch64.rpm \
+            linear-converter-x86_64-windows.zip linear-converter-macos.tar.gz; do
+            if ! printf '%s\n' "$have" | grep -qxF "$asset"; then
+              echo "::error::missing release asset '$asset'"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Add the downloads to the notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq '.body' > notes.md
+          # Rebuilding a published release must not append the table a second time.
+          if ! grep -q '^## 📦 Downloads' notes.md; then
+            export TAG
+            if [ -s notes.md ]; then printf '\n' >> notes.md; fi
+            # shellcheck disable=SC2016 # the list names the variables envsubst may replace
+            envsubst '$TAG' < .github/release/notes.md >> notes.md
+          fi
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --notes-file notes.md \
+            --draft=false \
+            --prerelease="$PRERELEASE" \
+            --latest="$([ "$PRERELEASE" = true ] && echo false || echo true)"
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"

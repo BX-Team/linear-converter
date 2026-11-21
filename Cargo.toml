@@ -1,0 +1,82 @@
+[package]
+name = "linear-converter"
+version = "1.0.0"
+description = "Linear Converter — convert Minecraft region files between Anvil, Linear and the older Linear layouts"
+authors = ["BX Team", "LuminolMC"]
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/BX-Team/linear-converter"
+repository = "https://github.com/BX-Team/linear-converter"
+keywords = ["minecraft", "region", "anvil", "linear", "zstd"]
+categories = ["command-line-utilities", "compression", "game-development"]
+include = ["/src", "/spec/dicts", "/LICENSE", "/README.md"]
+
+[lib]
+name = "linear_converter"
+
+[[bin]]
+name = "linear-converter"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+byteorder = "1.5"
+clap = { version = "4", features = ["derive"] }
+clap_complete = { version = "4.6", features = ["unstable-dynamic"] }
+flate2 = "1.1"
+indicatif = "0.18"
+lz4_flex = { version = "0.14", default-features = false, features = ["safe-decode", "std"] }
+rayon = "1.11"
+walkdir = "2.5"
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64"] }
+zstd = "0.14"
+
+[dev-dependencies]
+serde_json = "1"
+sha2 = "0.11"
+tempfile = "3"
+
+[profile.dev.package."*"]
+opt-level = 2
+
+# Compression dominates the run time, so the release build optimizes for speed, not size.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+# CI smoke builds; full LTO stays in `release`, which the packages use.
+[profile.ci]
+inherits = "release"
+codegen-units = 16
+lto = "thin"
+
+[package.metadata.deb]
+name = "linear-converter"
+maintainer = "BX Team"
+copyright = "LuminolMC, BX Team, MIT"
+license-file = ["LICENSE", "0"]
+extended-description = "Converts Minecraft region files between Anvil, DivineMC's Linear format and the older Linear layouts."
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/linear-converter", "usr/bin/", "755"],
+    ["target/completions/linear-converter.bash", "usr/share/bash-completion/completions/linear-converter", "644"],
+    ["target/completions/_linear-converter", "usr/share/zsh/vendor-completions/_linear-converter", "644"],
+    ["target/completions/linear-converter.fish", "usr/share/fish/vendor_completions.d/linear-converter.fish", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "linear-converter"
+summary = "Convert Minecraft region files between Anvil and Linear"
+assets = [
+    { source = "target/release/linear-converter", dest = "/usr/bin/linear-converter", mode = "755" },
+    { source = "target/completions/linear-converter.bash", dest = "/usr/share/bash-completion/completions/linear-converter", mode = "644" },
+    { source = "target/completions/_linear-converter", dest = "/usr/share/zsh/site-functions/_linear-converter", mode = "644" },
+    { source = "target/completions/linear-converter.fish", dest = "/usr/share/fish/vendor_completions.d/linear-converter.fish", mode = "644" },
+]
