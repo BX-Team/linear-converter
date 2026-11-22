@@ -157,3 +157,89 @@ fn written_files_read_back_and_carry_the_dictionary() {
         );
     }
 }
+
+#[test]
+fn small_chunks_are_written_as_packs() {
+    use linear_converter::model::{ChunkData, Region};
+    let dir = tempfile::tempdir().unwrap();
+    let mut region = Region::new(0, 0);
+    // void-world chunks: kilobytes of NBT that differ only in their coordinates
+    for index in 0..300_usize {
+        let mut raw = vec![0_u8; 4000];
+        raw[..4].copy_from_slice(&(index as u32).to_be_bytes());
+        region
+            .set_chunk(
+                index * 3,
+                ChunkData {
+                    timestamp: 1_700_000_000_000 + index as i64,
+                    raw_nbt: raw,
+                },
+            )
+            .unwrap();
+    }
+    let big: Vec<u8> = (0..200_000_u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    region
+        .set_chunk(
+            1000,
+            ChunkData {
+                timestamp: 1_700_000_000_500,
+                raw_nbt: big.clone(),
+            },
+        )
+        .unwrap();
+    let out = dir.path().join("region").join("r.0.0.linear");
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    linear_converter::writer::write_region_with_transaction(
+        linear_converter::format::RegionFormat::Linear,
+        &out,
+        |target| {
+            linear_converter::format::encode_region_to_writer_profiled(
+                &region,
+                linear_converter::format::RegionFormat::Linear,
+                6,
+                Some("region"),
+                target,
+                None,
+            )?;
+            Ok(())
+        },
+    )
+    .unwrap();
+    let bytes = std::fs::read(&out).unwrap();
+    assert_eq!(&bytes[8..10], &linear::MAJOR_VERSION.to_be_bytes());
+    let packs = (linear::LOG_START..bytes.len() - 4)
+        .filter(|&i| bytes[i..i + 4] == linear::PACK_MAGIC.to_be_bytes())
+        .count();
+    assert!(packs >= 300 / linear::PACK_MAX_MEMBERS, "{packs} packs");
+    let state = linear::read_state(&out, &bytes).unwrap();
+    assert_eq!(state.garbage_bytes(), 0);
+    assert_eq!(state.chunks.len(), 301);
+    for chunk in &state.chunks {
+        let original = region.chunk(chunk.index).unwrap();
+        assert_eq!(
+            chunk.result.as_ref().unwrap(),
+            &original.raw_nbt,
+            "chunk {}",
+            chunk.index
+        );
+        assert_eq!(chunk.timestamp, original.timestamp, "chunk {}", chunk.index);
+    }
+    assert!(
+        bytes.len() < 300 * 40 + big.len() + 4096,
+        "{} bytes",
+        bytes.len()
+    );
+}
+
+#[test]
+fn a_freshly_created_file_is_empty_without_warnings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r.0.0.linear");
+    let mut bytes = linear::header(0, 0).to_vec();
+    bytes.resize(linear::LOG_START, 0);
+    let state = linear::read_state(&path, &bytes).unwrap();
+    assert!(state.chunks.is_empty());
+    assert!(state.warnings.is_empty(), "{:?}", state.warnings);
+}

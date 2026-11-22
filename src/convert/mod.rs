@@ -378,11 +378,8 @@ fn process_job(
                 &job.destination_file,
                 profile_enabled.then_some(&mut transaction_profile),
                 |target| {
-                    let data_type = job
-                        .destination_file
-                        .parent()
-                        .and_then(|dir| dir.file_name())
-                        .and_then(|name| name.to_str());
+                    let data_type = data_type_of(&job.source_file)
+                        .or_else(|| data_type_of(&job.destination_file));
                     encoded_diagnostics = encode_region_to_writer_profiled(
                         &decoded.outcome.region,
                         target_format,
@@ -830,3 +827,32 @@ enum JobStage {
 struct NoopRunObserver;
 
 impl RunObserver for NoopRunObserver {}
+
+/// The data type (region, entities, poi) that picks the Linear dictionary: the name of the folder a region file sits
+/// in. The source decides, because an output folder of a converted region directory is named `region__<hash>`.
+fn data_type_of(path: &std::path::Path) -> Option<&str> {
+    let name = path.parent()?.file_name()?.to_str()?;
+    (crate::format::dicts::newest_for(name) != 0).then_some(name)
+}
+
+#[cfg(test)]
+mod data_type_tests {
+    use super::data_type_of;
+    use std::path::Path;
+
+    #[test]
+    fn data_type_comes_from_known_folder_names_only() {
+        assert_eq!(
+            data_type_of(Path::new("world/region/r.0.0.mca")),
+            Some("region")
+        );
+        assert_eq!(
+            data_type_of(Path::new("w/DIM-1/entities/r.0.0.mca")),
+            Some("entities")
+        );
+        assert_eq!(
+            data_type_of(Path::new("out/region__82cf3ef4/r.0.0.linear")),
+            None
+        );
+    }
+}

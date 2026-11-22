@@ -1,7 +1,8 @@
-//! The DivineMC Linear format, version 1 (`spec/SPEC.md`): an append-only log of chunk records with an index
-//! published through one of two slots. This module reads files with the recovery rules of the spec and writes fresh,
-//! compacted files.
+//! The DivineMC Linear format, version 2 (`spec/SPEC.md`): an append-only log of chunk records and packs of small
+//! chunks, with an index published through one of two slots. This module reads files of versions 1 and 2 with the
+//! recovery rules of the spec and writes fresh, compacted files of version 2.
 
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
@@ -19,7 +20,8 @@ use crate::model::{ChunkData, REGION_CHUNK_COUNT, Region};
 use crate::writer::RegionWriteTarget;
 
 pub const MAGIC: [u8; 8] = [0x89, b'L', b'I', b'N', 0x0D, 0x0A, 0x1A, 0x0A];
-pub const MAJOR_VERSION: u16 = 1;
+pub const MAJOR_VERSION: u16 = 2;
+pub const OLDEST_READABLE_MAJOR: u16 = 1;
 pub const MINOR_VERSION: u16 = 0;
 pub const HEADER_BYTES: usize = 32;
 pub const SLOT_BYTES: usize = 32;
@@ -28,6 +30,13 @@ pub const SLOT_B: usize = HEADER_BYTES + SLOT_BYTES;
 pub const LOG_START: usize = HEADER_BYTES + 2 * SLOT_BYTES;
 pub const RECORD_MAGIC: u32 = 0x4C4E_4352;
 pub const RECORD_HEADER_BYTES: usize = 36;
+pub const PACK_MAGIC: u32 = 0x4C4E_504B;
+pub const PACK_MEMBER_BYTES: usize = 6;
+// writer policy from the spec's "Recommendations for writers", not format limits
+pub const PACK_MAX_PAYLOAD: usize = 1024;
+pub const PACK_MAX_MEMBER_RAW: usize = 64 * 1024;
+pub const PACK_MAX_MEMBERS: usize = 64;
+pub const PACK_MAX_RAW: usize = 1024 * 1024;
 pub const INDEX_MAGIC: u32 = 0x4C4E_4958;
 pub const INDEX_HEADER_BYTES: usize = 28;
 pub const INDEX_ENTRY_BYTES: usize = 20;
@@ -105,6 +114,8 @@ fn parse_index(bytes: &[u8], generation: u64, index_offset: usize) -> Option<Vec
         return None;
     }
     let mut entries = Vec::with_capacity(REGION_CHUNK_COUNT);
+    let mut length_at: HashMap<u64, u32> = HashMap::new();
+    let index_offset = index_offset as u64;
     for i in 0..REGION_CHUNK_COUNT {
         let at = i * INDEX_ENTRY_BYTES;
         let entry = Entry {
@@ -112,12 +123,18 @@ fn parse_index(bytes: &[u8], generation: u64, index_offset: usize) -> Option<Vec
             length: be_u32(&body, at + 8),
             timestamp: be_u64(&body, at + 12) as i64,
         };
-        if entry.offset != 0
-            && (entry.offset < LOG_START as u64
+        if entry.offset != 0 {
+            if entry.offset < LOG_START as u64
+                || entry.offset > index_offset
                 || (entry.length as usize) < RECORD_HEADER_BYTES
-                || entry.offset + entry.length as u64 > index_offset as u64)
-        {
-            return None;
+                || entry.length as u64 > index_offset - entry.offset
+            {
+                return None;
+            }
+            // chunks of one pack point at the same record and must agree on its length
+            if *length_at.entry(entry.offset).or_insert(entry.length) != entry.length {
+                return None;
+            }
         }
         entries.push(entry);
     }
@@ -159,6 +176,21 @@ fn salvage(bytes: &[u8]) -> Vec<Entry> {
                 pos = end;
                 continue;
             }
+        } else if magic == PACK_MAGIC {
+            if let Some((length, pack)) = salvage_pack(bytes, pos) {
+                for index in pack.members.iter().map(|m| m.0) {
+                    let timestamp = pack.timestamp;
+                    if entries[index].offset == 0 || timestamp >= entries[index].timestamp {
+                        entries[index] = Entry {
+                            offset: pos as u64,
+                            length: length as u32,
+                            timestamp,
+                        };
+                    }
+                }
+                pos += length;
+                continue;
+            }
         } else if magic == INDEX_MAGIC && pos + INDEX_HEADER_BYTES <= bytes.len() {
             let end = pos + INDEX_HEADER_BYTES + be_u32(bytes, pos + 16) as usize;
             if end <= bytes.len()
@@ -171,6 +203,105 @@ fn salvage(bytes: &[u8]) -> Vec<Entry> {
         pos += 1;
     }
     entries
+}
+
+/// The pack at `pos` and its length, when all of it checks out; salvage accepts nothing less.
+fn salvage_pack(bytes: &[u8], pos: usize) -> Option<(usize, Pack)> {
+    if pos + RECORD_HEADER_BYTES > bytes.len() {
+        return None;
+    }
+    let end = pos + RECORD_HEADER_BYTES + be_u32(bytes, pos + 12) as usize;
+    if end > bytes.len() {
+        return None;
+    }
+    decode_pack(&bytes[pos..end])
+        .ok()
+        .map(|pack| (end - pos, pack))
+}
+
+/// The decompressed chunks of one pack.
+#[derive(Debug)]
+pub struct Pack {
+    pub dictionary_id: u32,
+    pub timestamp: i64,
+    /// (local index, start, length) of each member's NBT in `raw`
+    members: Vec<(usize, usize, usize)>,
+    raw: Vec<u8>,
+}
+
+impl Pack {
+    pub fn member(&self, index: usize) -> std::result::Result<Vec<u8>, String> {
+        let at = self
+            .members
+            .binary_search_by_key(&index, |m| m.0)
+            .map_err(|_| format!("index points at a pack that does not hold chunk {index}"))?;
+        let (_, start, length) = self.members[at];
+        Ok(self.raw[start..start + length].to_vec())
+    }
+}
+
+/// Checks a pack record and decompresses all of its chunks.
+pub fn decode_pack(record: &[u8]) -> std::result::Result<Pack, String> {
+    if record.len() < RECORD_HEADER_BYTES || be_u32(record, 0) != PACK_MAGIC {
+        return Err("not a pack record".to_string());
+    }
+    let count = be_u16(record, 4) as usize;
+    let dict_id = be_u32(record, 8);
+    let compressed = be_u32(record, 12) as usize;
+    let raw = be_u32(record, 16) as usize;
+    let timestamp = be_u64(record, 20) as i64;
+    if count == 0
+        || count > REGION_CHUNK_COUNT
+        || raw < count * PACK_MEMBER_BYTES
+        || raw > MAX_RAW_LENGTH
+        || compressed > raw + raw / 128 + 1024
+    {
+        return Err("pack record claims an impossible size".to_string());
+    }
+    if RECORD_HEADER_BYTES + compressed != record.len() {
+        return Err("pack record has a length that disagrees with the index".to_string());
+    }
+    let payload = &record[RECORD_HEADER_BYTES..];
+    if xxh64(payload, 0) != be_u64(record, 28) {
+        return Err("checksum mismatch in pack record".to_string());
+    }
+    let out = if dict_id == 0 {
+        zstd::bulk::decompress(payload, raw)
+    } else {
+        let dict = dicts::get(dict_id).ok_or_else(|| {
+            format!("pack needs zstd dictionary {dict_id}, which this build does not have")
+        })?;
+        zstd::bulk::Decompressor::with_dictionary(dict).and_then(|mut d| d.decompress(payload, raw))
+    }
+    .map_err(|e| format!("pack does not decompress: {e}"))?;
+    if out.len() != raw {
+        return Err(format!(
+            "pack decompressed to {} bytes, expected {raw}",
+            out.len()
+        ));
+    }
+    let mut members: Vec<(usize, usize, usize)> = Vec::with_capacity(count);
+    let mut at = count * PACK_MEMBER_BYTES;
+    for i in 0..count {
+        let index = be_u16(&out, i * PACK_MEMBER_BYTES) as usize;
+        let length = be_u32(&out, i * PACK_MEMBER_BYTES + 2) as usize;
+        if index >= REGION_CHUNK_COUNT || members.last().is_some_and(|m| index <= m.0) {
+            return Err("pack record has a corrupt member table".to_string());
+        }
+        members.push((index, at, length));
+        at = at.saturating_add(length);
+    }
+    if at != raw {
+        return Err(format!(
+            "pack members add up to {at} bytes, header says {raw}"
+        ));
+    }
+    Ok(Pack {
+        dictionary_id: dict_id,
+        timestamp,
+        members,
+        raw: out,
+    })
 }
 
 /// Decodes one record (header and payload) of chunk `index`.
@@ -225,6 +356,15 @@ pub fn decode_record(
 pub fn read_state(path: &Path, bytes: &[u8]) -> Result<FileState> {
     let mut warnings = Vec::new();
     if bytes.len() < LOG_START {
+        if bytes.len() >= 8 && be_u64(bytes, 0) == crate::format::LINEAR_SUPERBLOCK {
+            bail!("{} is in a legacy Linear layout", path.display());
+        }
+        // a cut-off creation is a prefix of the magic; anything else is not ours and must not read as empty
+        ensure!(
+            MAGIC.starts_with(&bytes[..bytes.len().min(MAGIC.len())]),
+            "{} is not a Linear file",
+            path.display()
+        );
         return Ok(FileState {
             generation: 0,
             chunks: Vec::new(),
@@ -248,8 +388,8 @@ pub fn read_state(path: &Path, bytes: &[u8]) -> Result<FileState> {
     );
     let major = be_u16(bytes, 8);
     ensure!(
-        major == MAJOR_VERSION,
-        "{} is Linear format {major}, this build reads {MAJOR_VERSION}",
+        (OLDEST_READABLE_MAJOR..=MAJOR_VERSION).contains(&major),
+        "{} is Linear format {major}, this build reads {OLDEST_READABLE_MAJOR} to {MAJOR_VERSION}",
         path.display()
     );
     if let Ok((x, z)) = parse_region_coords_from_path(path) {
@@ -299,6 +439,19 @@ pub fn read_state(path: &Path, bytes: &[u8]) -> Result<FileState> {
     );
     let (generation, index_length, entries) = match best {
         Some((generation, _, index_length, entries)) => (generation, index_length, entries),
+        // a file as it is created, before its first flush: empty, nothing to salvage
+        None if bytes.len() == LOG_START => (
+            0,
+            0,
+            vec![
+                Entry {
+                    offset: 0,
+                    length: 0,
+                    timestamp: 0
+                };
+                REGION_CHUNK_COUNT
+            ],
+        ),
         None => {
             let damaged = be_u64(bytes, SLOT_A) != 0 || be_u64(bytes, SLOT_B) != 0;
             let entries = salvage(bytes);
@@ -317,13 +470,29 @@ pub fn read_state(path: &Path, bytes: &[u8]) -> Result<FileState> {
 
     let mut chunks = Vec::new();
     let mut live = index_length;
+    let mut counted = HashSet::new();
+    let mut packs: HashMap<u64, std::result::Result<Pack, String>> = HashMap::new();
     for (index, entry) in entries.iter().enumerate() {
         if entry.offset == 0 {
             continue;
         }
-        live += entry.length as usize;
+        if counted.insert(entry.offset) {
+            live += entry.length as usize;
+        }
         let record = &bytes[entry.offset as usize..entry.offset as usize + entry.length as usize];
-        let decoded = decode_record(record, index);
+        let decoded = if record.len() >= 4 && be_u32(record, 0) == PACK_MAGIC {
+            match packs
+                .entry(entry.offset)
+                .or_insert_with(|| decode_pack(record))
+            {
+                Ok(pack) => pack
+                    .member(index)
+                    .map(|raw| (pack.dictionary_id, raw.len(), raw)),
+                Err(error) => Err(format!("chunk {index}: {error}")),
+            }
+        } else {
+            decode_record(record, index)
+        };
         let (dictionary_id, raw_length) = match &decoded {
             Ok((d, r, _)) => (*d, *r),
             Err(_) => (
@@ -402,9 +571,13 @@ pub fn read_region_bytes(path: &Path, bytes: &[u8]) -> Result<ReadOutcome> {
 }
 
 pub fn header(region_x: i32, region_z: i32) -> [u8; HEADER_BYTES] {
+    header_of_version(MAJOR_VERSION, region_x, region_z)
+}
+
+pub fn header_of_version(major: u16, region_x: i32, region_z: i32) -> [u8; HEADER_BYTES] {
     let mut out = [0_u8; HEADER_BYTES];
     out[..8].copy_from_slice(&MAGIC);
-    out[8..10].copy_from_slice(&MAJOR_VERSION.to_be_bytes());
+    out[8..10].copy_from_slice(&major.to_be_bytes());
     out[10..12].copy_from_slice(&MINOR_VERSION.to_be_bytes());
     out[16..20].copy_from_slice(&region_x.to_be_bytes());
     out[20..24].copy_from_slice(&region_z.to_be_bytes());
@@ -452,6 +625,51 @@ pub fn encode_record(
     Ok(out)
 }
 
+/// Builds a complete pack of `members` (local index, NBT, timestamp), which must be in ascending index order.
+pub fn encode_pack(
+    members: &[(usize, Vec<u8>, i64)],
+    dict_id: u32,
+    compressor: &mut zstd::bulk::Compressor<'_>,
+) -> Result<Vec<u8>> {
+    ensure!(
+        !members.is_empty() && members.len() <= REGION_CHUNK_COUNT,
+        "a pack holds 1 to {REGION_CHUNK_COUNT} chunks"
+    );
+    let raw_total: usize =
+        members.len() * PACK_MEMBER_BYTES + members.iter().map(|m| m.1.len()).sum::<usize>();
+    ensure!(
+        raw_total <= MAX_RAW_LENGTH,
+        "pack of {raw_total} bytes is over the format limit"
+    );
+    let mut raw = Vec::with_capacity(raw_total);
+    for (i, (index, nbt, _)) in members.iter().enumerate() {
+        ensure!(
+            i == 0 || *index > members[i - 1].0,
+            "pack members must be in ascending order"
+        );
+        raw.extend_from_slice(&(*index as u16).to_be_bytes());
+        raw.extend_from_slice(&(nbt.len() as u32).to_be_bytes());
+    }
+    for (_, nbt, _) in members {
+        raw.extend_from_slice(nbt);
+    }
+    let newest = members.iter().map(|m| m.2).max().unwrap_or(0);
+    let payload = compressor
+        .compress(&raw)
+        .context("zstd compression failed")?;
+    let mut out = Vec::with_capacity(RECORD_HEADER_BYTES + payload.len());
+    out.extend_from_slice(&PACK_MAGIC.to_be_bytes());
+    out.extend_from_slice(&(members.len() as u16).to_be_bytes());
+    out.extend_from_slice(&0_u16.to_be_bytes());
+    out.extend_from_slice(&dict_id.to_be_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+    out.extend_from_slice(&newest.to_be_bytes());
+    out.extend_from_slice(&xxh64(&payload, 0).to_be_bytes());
+    out.extend_from_slice(&payload);
+    Ok(out)
+}
+
 pub fn encode_index(generation: u64, entries: &[(u64, u32, i64)]) -> Result<Vec<u8>> {
     let mut body = Vec::with_capacity(INDEX_BODY_BYTES);
     for &(offset, length, timestamp) in entries {
@@ -482,9 +700,14 @@ pub fn encode_region_to_writer(
         Some(dict) => zstd::bulk::Compressor::with_dictionary(compression_level, dict)?,
         None => zstd::bulk::Compressor::new(compression_level)?,
     };
-    let mut body = Vec::new();
-    let mut entries = vec![(0_u64, 0_u32, 0_i64); REGION_CHUNK_COUNT];
-    let mut position = LOG_START as u64;
+    let mut out = Output {
+        body: Vec::new(),
+        entries: vec![(0_u64, 0_u32, 0_i64); REGION_CHUNK_COUNT],
+        position: LOG_START as u64,
+    };
+    // small chunks wait here for a pack; (index, NBT, timestamp, the chunk's own record)
+    let mut group: Vec<(usize, Vec<u8>, i64, Vec<u8>)> = Vec::new();
+    let mut group_raw = 0_usize;
     for (index, chunk) in region.iter_chunks() {
         let started = Instant::now();
         let timestamp = normalize_timestamp_to_millis(chunk.timestamp);
@@ -493,10 +716,27 @@ pub fn encode_region_to_writer(
             profile.record_compress(started.elapsed());
             profile.record_unit(chunk.raw_nbt.len(), record.len());
         }
-        entries[index] = (position, record.len() as u32, timestamp);
-        position += record.len() as u64;
-        body.extend_from_slice(&record);
+        if record.len() - RECORD_HEADER_BYTES > PACK_MAX_PAYLOAD
+            || chunk.raw_nbt.len() > PACK_MAX_MEMBER_RAW
+        {
+            out.push(&record, &[(index, timestamp)]);
+            continue;
+        }
+        if group.len() == PACK_MAX_MEMBERS
+            || (!group.is_empty() && group_raw + chunk.raw_nbt.len() > PACK_MAX_RAW)
+        {
+            out.push_group(&mut group, dict_id, &mut compressor)?;
+            group_raw = 0;
+        }
+        group_raw += chunk.raw_nbt.len();
+        group.push((index, chunk.raw_nbt.clone(), timestamp, record));
     }
+    out.push_group(&mut group, dict_id, &mut compressor)?;
+    let Output {
+        body,
+        entries,
+        position,
+    } = out;
     let index = encode_index(1, &entries)?;
     let started = Instant::now();
     let file = target.main_file();
@@ -509,4 +749,47 @@ pub fn encode_region_to_writer(
         profile.record_file_write(started.elapsed());
     }
     Ok(Vec::new())
+}
+
+struct Output {
+    body: Vec<u8>,
+    entries: Vec<(u64, u32, i64)>,
+    position: u64,
+}
+
+impl Output {
+    fn push(&mut self, record: &[u8], members: &[(usize, i64)]) {
+        for &(index, timestamp) in members {
+            self.entries[index] = (self.position, record.len() as u32, timestamp);
+        }
+        self.position += record.len() as u64;
+        self.body.extend_from_slice(record);
+    }
+
+    /// Writes the waiting small chunks as one pack, or as its own record when only one waits.
+    fn push_group(
+        &mut self,
+        group: &mut Vec<(usize, Vec<u8>, i64, Vec<u8>)>,
+        dict_id: u32,
+        compressor: &mut zstd::bulk::Compressor<'_>,
+    ) -> Result<()> {
+        match group.len() {
+            0 => {}
+            1 => {
+                let (index, _, timestamp, record) = &group[0];
+                self.push(record, &[(*index, *timestamp)]);
+            }
+            _ => {
+                let members: Vec<(usize, Vec<u8>, i64)> = group
+                    .drain(..)
+                    .map(|(index, raw, timestamp, _)| (index, raw, timestamp))
+                    .collect();
+                let pack = encode_pack(&members, dict_id, compressor)?;
+                let pointers: Vec<(usize, i64)> = members.iter().map(|m| (m.0, m.2)).collect();
+                self.push(&pack, &pointers);
+            }
+        }
+        group.clear();
+        Ok(())
+    }
 }

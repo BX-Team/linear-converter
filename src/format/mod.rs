@@ -29,7 +29,7 @@ const MILLIS_TIMESTAMP_THRESHOLD: i64 = 10_000_000_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum RegionFormat {
     Mca,
-    /// DivineMC Linear format 1 (append-only log, `spec/SPEC.md`)
+    /// DivineMC Linear format 2 (append-only log, `spec/SPEC.md`)
     Linear,
     /// the Linear layouts before it (xymb, LinearPurpur, DivineMC V1/V2/V3); written as linear v3
     LinearLegacy,

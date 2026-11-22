@@ -14,7 +14,7 @@ Converts Minecraft region files between Anvil, DivineMC's Linear format and the 
 
 ## ✨ Features
 
-- **Linear format 1** — reads and writes [DivineMC](https://github.com/BX-Team/DivineMC)'s Linear format: an append-only log of zstd records with shipped dictionaries, about half the size of Anvil.
+- **Linear format 2** — reads and writes [DivineMC](https://github.com/BX-Team/DivineMC)'s Linear format: an append-only log of zstd records with shipped dictionaries, about half the size of Anvil; small chunks (void and superflat worlds, empty entity chunks) share packs. Format 1 files read as they are.
 - **Both directions** — Anvil to Linear and back, so a world is never locked into one format.
 - **Every older layout** — classic Linear v1/v2 (xymb, LinearPurpur, Kaiiju, Leaves), linear v3, DivineMC Linear V1/V2/V3 and Buffered `.b_linear`, including a `.swp` file a crash left behind.
 - **Whole worlds** — `region`, `entities` and `poi` of every dimension, Bukkit layouts like `world_nether/DIM-1` included, and Anvil's external `.mcc` chunks.
@@ -54,7 +54,7 @@ The output keeps the world's folder structure under `-o`; move it into place onc
 
 | Option | Meaning |
 | --- | --- |
-| `-t, --to <FORMAT>` | `mca`, `linear`, `linear-legacy` (linear v3, for servers that do not read format 1), `blinear-v2`, `blinear-v3` |
+| `-t, --to <FORMAT>` | `mca`, `linear`, `linear-legacy` (linear v3, for servers that do not read the current format), `blinear-v2`, `blinear-v3` |
 | `-o, --output <DIR>` | where the converted save goes |
 | `--from <FORMAT>` | read every input as this format instead of detecting it |
 | `-j, --threads <N>` | worker threads (default: all CPU threads) |

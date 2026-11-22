@@ -70,7 +70,7 @@ pub struct InfoArgs {
 pub enum SourceFormatArg {
     Auto,
     Mca,
-    /// Any `.linear` file: format 1 or a legacy layout, told apart by its header.
+    /// Any `.linear` file: format 1 or 2, or a legacy layout, told apart by its header.
     Linear,
     BlinearV2,
     BlinearV3,
@@ -80,9 +80,9 @@ pub enum SourceFormatArg {
 pub enum TargetFormatArg {
     /// Minecraft's Anvil format.
     Mca,
-    /// DivineMC Linear format 1.
+    /// DivineMC Linear format 2.
     Linear,
-    /// The old Linear layout (linear v3), for servers that do not read format 1.
+    /// The old Linear layout (linear v3), for servers that do not read the current format.
     LinearLegacy,
     BlinearV2,
     BlinearV3,
