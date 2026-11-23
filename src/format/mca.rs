@@ -432,14 +432,18 @@ fn zlib_compress(bytes: &[u8], compression: Compression) -> Result<Vec<u8>> {
 
 fn zlib_decompress(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = ZlibDecoder::new(bytes);
-    let mut output = Vec::new();
+    // Chunk NBT inflates roughly 5-6x; reserving up front avoids repeated regrow-and-copy.
+    let mut output = Vec::with_capacity(bytes.len().saturating_mul(6));
     decoder.read_to_end(&mut output)?;
+    output.shrink_to_fit();
     Ok(output)
 }
 
 fn gzip_decompress(bytes: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = GzDecoder::new(bytes);
-    let mut output = Vec::new();
+    // Chunk NBT inflates roughly 5-6x; reserving up front avoids repeated regrow-and-copy.
+    let mut output = Vec::with_capacity(bytes.len().saturating_mul(6));
     decoder.read_to_end(&mut output)?;
+    output.shrink_to_fit();
     Ok(output)
 }

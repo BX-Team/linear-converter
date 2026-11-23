@@ -31,7 +31,9 @@ pub struct MemoryGuard {
 
 impl RuntimeResources {
     pub fn for_thread_count(thread_count: usize) -> Self {
-        let io_permits = thread_count.clamp(1, 4);
+        // Decoding (read + decompress) is mostly CPU work too, so the permit count follows the
+        // worker count instead of a small fixed cap that left most cores idle.
+        let io_permits = thread_count.max(1);
         let memory_budget_bytes =
             MIN_MEMORY_BUDGET_BYTES.max(thread_count as u64 * MEMORY_BYTES_PER_THREAD);
 
@@ -43,10 +45,6 @@ impl RuntimeResources {
     }
 
     pub fn acquire_decode_io(&self) -> PermitGuard {
-        self.io.acquire(1)
-    }
-
-    pub fn acquire_write_io(&self) -> PermitGuard {
         self.io.acquire(1)
     }
 

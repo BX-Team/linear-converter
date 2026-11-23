@@ -369,9 +369,8 @@ fn process_job(
         let mut encode_profile = profile_enabled.then(EncodeProfile::default);
         let mut transaction_profile = WriteTransactionProfile::default();
         {
-            let wait_started_at = Instant::now();
-            let _io_guard = resources.acquire_write_io();
-            profile.wait_write_io = wait_started_at.elapsed();
+            // Encoding is CPU-bound zstd/zlib work, so it must not sit behind an IO permit:
+            // gating it capped the whole run at a handful of busy cores.
             stage = JobStage::Write;
             write_region_with_transaction_profiled(
                 target_format,
