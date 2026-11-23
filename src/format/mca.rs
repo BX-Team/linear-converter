@@ -1,6 +1,5 @@
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, SeekFrom, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -27,20 +26,18 @@ const MCA_EXTERNAL_ZLIB: u8 = MCA_EXTERNAL_FLAG | MCA_COMPRESSION_ZLIB;
 const MAX_INLINE_SECTORS: usize = 255;
 
 pub fn read_region(path: &Path) -> Result<ReadOutcome> {
-    let mut file =
-        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let file_len = file
-        .metadata()
-        .with_context(|| format!("failed to read metadata for {}", path.display()))?
-        .len() as usize;
-    let mut header = [0_u8; MCA_HEADER_SIZE];
-    file.read_exact(&mut header)
-        .with_context(|| format!("failed to read mca header from {}", path.display()))?;
+    let bytes = read_file_bytes(path)?;
+    read_region_bytes(path, &bytes)
+}
+
+pub(crate) fn read_region_bytes(path: &Path, bytes: &[u8]) -> Result<ReadOutcome> {
+    let file_len = bytes.len();
     ensure!(
         file_len >= MCA_HEADER_SIZE,
         "mca region {} is smaller than the 8 KiB header",
         path.display()
     );
+    let header = &bytes[..MCA_HEADER_SIZE];
 
     let (region_x, region_z) = parse_region_coords_from_path(path)?;
     let mut region = Region::new(region_x, region_z);
@@ -99,18 +96,7 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
             continue;
         }
 
-        let mut chunk_bytes = vec![0_u8; sector_count * MCA_SECTOR_SIZE];
-        file.seek(SeekFrom::Start(chunk_offset as u64))
-            .with_context(|| {
-                format!("failed to seek to chunk slot {index} in {}", path.display())
-            })?;
-        file.read_exact(&mut chunk_bytes).with_context(|| {
-            format!(
-                "failed to read {} sectors for chunk slot {index} in {}",
-                sector_count,
-                path.display()
-            )
-        })?;
+        let chunk_bytes = &bytes[chunk_offset..chunk_limit];
 
         let chunk_len = u32::from_be_bytes(chunk_bytes[0..4].try_into().unwrap()) as usize;
         let compression_type = chunk_bytes[4];
@@ -120,7 +106,7 @@ pub fn read_region(path: &Path) -> Result<ReadOutcome> {
             region_x,
             region_z,
             index,
-            &chunk_bytes,
+            chunk_bytes,
             chunk_len,
             compression_type,
         ) {
@@ -435,7 +421,10 @@ fn zlib_decompress(bytes: &[u8]) -> Result<Vec<u8>> {
     // Chunk NBT inflates roughly 5-6x; reserving up front avoids repeated regrow-and-copy.
     let mut output = Vec::with_capacity(bytes.len().saturating_mul(6));
     decoder.read_to_end(&mut output)?;
-    output.shrink_to_fit();
+    // Shrinking copies the whole buffer, so only do it when the slack is worth reclaiming.
+    if output.capacity() > output.len().saturating_mul(2) {
+        output.shrink_to_fit();
+    }
     Ok(output)
 }
 
@@ -444,6 +433,9 @@ fn gzip_decompress(bytes: &[u8]) -> Result<Vec<u8>> {
     // Chunk NBT inflates roughly 5-6x; reserving up front avoids repeated regrow-and-copy.
     let mut output = Vec::with_capacity(bytes.len().saturating_mul(6));
     decoder.read_to_end(&mut output)?;
-    output.shrink_to_fit();
+    // Shrinking copies the whole buffer, so only do it when the slack is worth reclaiming.
+    if output.capacity() > output.len().saturating_mul(2) {
+        output.shrink_to_fit();
+    }
     Ok(output)
 }

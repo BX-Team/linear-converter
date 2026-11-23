@@ -63,6 +63,7 @@ fn conversion_cli(
         source: from.into_source_format_hint(),
         target: to.into_region_format(),
         threads: Some(1),
+        io_threads: None,
         compression_level: None,
         profile: false,
     }

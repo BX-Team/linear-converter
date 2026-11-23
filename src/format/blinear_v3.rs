@@ -1,4 +1,4 @@
-use std::io::{Seek, SeekFrom, Write};
+use std::io::SeekFrom;
 use std::path::Path;
 use std::time::Instant;
 

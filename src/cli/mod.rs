@@ -48,6 +48,9 @@ pub struct ConvertArgs {
     /// Worker threads (default: all CPU threads).
     #[arg(long, short = 'j', value_name = "N")]
     pub threads: Option<usize>,
+    /// Region files read or written at once (default: 4). Raise it on fast SSDs.
+    #[arg(long, value_name = "N")]
+    pub io_threads: Option<usize>,
     /// Compression level: zlib 0-9 for mca, zstd 1-22 otherwise (default: 6).
     #[arg(long, short, value_name = "LEVEL")]
     pub level: Option<i32>,
@@ -120,6 +123,7 @@ impl From<ConvertArgs> for ConvertOptions {
             source: args.from.into_source_format_hint(),
             target: args.to.into_region_format(),
             threads: args.threads,
+            io_threads: args.io_threads,
             compression_level: args.level,
             profile: args.profile,
         }

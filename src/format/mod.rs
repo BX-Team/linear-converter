@@ -246,6 +246,39 @@ pub fn decode_region(path: &Path, hint: SourceFormatHint) -> Result<DecodedRegio
     }
 }
 
+/// Same as `decode_region`, but parses bytes the caller already read from `path`. Sidecar files
+/// (`.mcc` chunks, `.swp` swaps) are still opened by path.
+pub fn decode_region_bytes(
+    path: &Path,
+    hint: SourceFormatHint,
+    bytes: &[u8],
+) -> Result<DecodedRegion> {
+    let storage_format = match hint {
+        SourceFormatHint::Mca => RegionStorageFormat::Mca,
+        SourceFormatHint::Linear => linear_legacy::detect_storage_format_from_bytes(path, bytes)?,
+        SourceFormatHint::BlinearFamily => detect_blinear_format_from_bytes(path, bytes)?,
+        SourceFormatHint::BlinearV2 => RegionStorageFormat::BlinearV2,
+        SourceFormatHint::BlinearV3 => RegionStorageFormat::BlinearV3,
+    };
+    let outcome = match storage_format {
+        RegionStorageFormat::Mca => mca::read_region_bytes(path, bytes)?,
+        RegionStorageFormat::Linear => linear::read_region_bytes(path, bytes)?,
+        RegionStorageFormat::LinearV1
+        | RegionStorageFormat::LinearV2
+        | RegionStorageFormat::LinearV3
+        | RegionStorageFormat::LinearV4 => {
+            linear_legacy::read_region_from_bytes(path, bytes, storage_format)?
+        }
+        RegionStorageFormat::BlinearV2 => blinear_v2::read_region_bytes(path, bytes)?,
+        RegionStorageFormat::BlinearV3 => blinear_v3::read_region_bytes(path, bytes)?,
+    };
+    Ok(DecodedRegion {
+        format: storage_format.as_region_format(),
+        storage_format,
+        outcome,
+    })
+}
+
 pub fn read_region(path: &Path, format: RegionFormat) -> Result<ReadOutcome> {
     match format {
         RegionFormat::Mca => mca::read_region(path),

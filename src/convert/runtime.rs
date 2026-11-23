@@ -4,6 +4,9 @@ use std::time::Duration;
 const MIN_MEMORY_JOB_BYTES: u64 = 32 * 1024 * 1024;
 const MEMORY_BYTES_PER_THREAD: u64 = 96 * 1024 * 1024;
 const MIN_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+// A job holds the source bytes (1x), the decoded NBT (~5-6x inflate) and the encoded output
+// buffer (~1x) at its peak, so it reserves 8x its file size.
+const MEMORY_BYTES_PER_INPUT_BYTE: u64 = 8;
 
 #[derive(Clone)]
 pub struct RuntimeResources {
@@ -30,10 +33,10 @@ pub struct MemoryGuard {
 }
 
 impl RuntimeResources {
-    pub fn for_thread_count(thread_count: usize) -> Self {
-        // Decoding (read + decompress) is mostly CPU work too, so the permit count follows the
-        // worker count instead of a small fixed cap that left most cores idle.
-        let io_permits = thread_count.max(1);
+    /// Only file reads and writes hold an IO permit; decompress and compress run outside it,
+    /// so a small cap protects HDDs and network shares without idling CPU cores.
+    pub fn new(thread_count: usize, io_thread_count: usize) -> Self {
+        let io_permits = io_thread_count.max(1);
         let memory_budget_bytes =
             MIN_MEMORY_BUDGET_BYTES.max(thread_count as u64 * MEMORY_BYTES_PER_THREAD);
 
@@ -48,9 +51,13 @@ impl RuntimeResources {
         self.io.acquire(1)
     }
 
+    pub fn acquire_write_io(&self) -> PermitGuard {
+        self.io.acquire(1)
+    }
+
     pub fn acquire_memory_for_job(&self, estimated_size_bytes: u64) -> MemoryGuard {
         let requested = estimated_size_bytes
-            .saturating_mul(4)
+            .saturating_mul(MEMORY_BYTES_PER_INPUT_BYTE)
             .max(MIN_MEMORY_JOB_BYTES)
             .min(self.memory_budget_bytes);
         self.memory.acquire(requested)

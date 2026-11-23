@@ -109,6 +109,7 @@ impl RunObserver for ConsoleReporter {
                 plan.thread_count, plan.requested_thread_count
             );
         }
+        println!("  IO threads: {}", plan.io_thread_count);
         println!("  Compression level: {}", plan.compression_level);
         if plan.profile {
             println!("  Profiling: enabled");

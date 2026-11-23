@@ -16,9 +16,11 @@ use crate::convert::planner::{ConversionPlan, plan_conversion};
 use crate::convert::runtime::RuntimeResources;
 use crate::diagnostic::{Diagnostic, DiagnosticCode, warning_count};
 use crate::format::{
-    EncodeProfile, RegionFormat, SourceFormatHint, decode_region, encode_region_to_writer_profiled,
+    EncodeProfile, RegionFormat, SourceFormatHint, decode_region_bytes,
+    encode_region_to_writer_profiled,
 };
-use crate::writer::{WriteTransactionProfile, write_region_with_transaction_profiled};
+use crate::io::read_file_bytes;
+use crate::writer::{BufferedRegion, WriteTransactionProfile};
 
 pub use crate::convert::planner::{ConvertOptions, FormatBreakdown, InspectOptions, RunPlan};
 
@@ -232,7 +234,7 @@ fn execute_jobs(plan: ConversionPlan, observer: &mut dyn RunObserver) -> Result<
     let profile_enabled = plan.run_plan.profile;
     let total_jobs = jobs.len();
     let started_at = Instant::now();
-    let resources = RuntimeResources::for_thread_count(thread_count);
+    let resources = RuntimeResources::new(thread_count, plan.run_plan.io_thread_count);
     let mut accumulator = SummaryAccumulator::new(
         total_jobs,
         total_region_directories,
@@ -346,72 +348,87 @@ fn process_job(
         let _memory_guard = resources.acquire_memory_for_job(job.estimated_size_bytes);
         profile.wait_memory = wait_started_at.elapsed();
 
+        // Only the file read holds the IO permit; decompression runs after it is released.
         let decode_started_at = Instant::now();
-        let decoded = {
+        let source_bytes = {
             let wait_started_at = Instant::now();
             let _io_guard = resources.acquire_decode_io();
             profile.wait_decode_io = wait_started_at.elapsed();
-            decode_region(&job.source_file, job.source_format).map_err(|error| {
-                anyhow!("failed to decode {}: {error:#}", job.source_file.display())
-            })?
-        };
+            read_file_bytes(&job.source_file)
+        }
+        .map_err(|error| anyhow!("failed to read {}: {error:#}", job.source_file.display()))?;
+        let mut decoded = decode_region_bytes(&job.source_file, job.source_format, &source_bytes)
+            .map_err(|error| {
+            anyhow!("failed to decode {}: {error:#}", job.source_file.display())
+        })?;
+        drop(source_bytes);
         profile.decode = decode_started_at.elapsed();
 
-        let mut decoded = decoded;
         resolved_source_format = Some(decoded.format);
         diagnostics.append(&mut decoded.outcome.diagnostics);
         discarded_chunks = decoded.outcome.discarded_chunks;
         let chunk_count = decoded.outcome.region.chunk_count();
 
+        // Compress into memory without a permit, then take one only for the disk write + commit.
         stage = JobStage::Encode;
         let encode_write_started_at = Instant::now();
-        let mut encoded_diagnostics = Vec::new();
         let mut encode_profile = profile_enabled.then(EncodeProfile::default);
         let mut transaction_profile = WriteTransactionProfile::default();
-        {
-            // Encoding is CPU-bound zstd/zlib work, so it must not sit behind an IO permit:
-            // gating it capped the whole run at a handful of busy cores.
-            stage = JobStage::Write;
-            write_region_with_transaction_profiled(
-                target_format,
-                &job.destination_file,
-                profile_enabled.then_some(&mut transaction_profile),
-                |target| {
-                    let data_type = data_type_of(&job.source_file)
-                        .or_else(|| data_type_of(&job.destination_file));
-                    encoded_diagnostics = encode_region_to_writer_profiled(
-                        &decoded.outcome.region,
-                        target_format,
-                        compression_level,
-                        data_type,
-                        target,
-                        encode_profile.as_mut(),
-                    )?;
-                    Ok(())
-                },
+        let data_type =
+            data_type_of(&job.source_file).or_else(|| data_type_of(&job.destination_file));
+        let mut buffered = BufferedRegion::new();
+        let mut encoded_diagnostics = encode_region_to_writer_profiled(
+            &decoded.outcome.region,
+            target_format,
+            compression_level,
+            data_type,
+            &mut buffered,
+            encode_profile.as_mut(),
+        )
+        .map_err(|error| {
+            anyhow!(
+                "failed to encode {} as {}: {error:#}",
+                job.source_file.display(),
+                target_format
             )
-            .map_err(|error| {
-                anyhow!(
-                    "failed to encode and write {} as {}: {error:#}",
-                    job.source_file.display(),
-                    target_format
+        })?;
+        drop(decoded);
+
+        stage = JobStage::Write;
+        let disk_write = {
+            let wait_started_at = Instant::now();
+            let _io_guard = resources.acquire_write_io();
+            profile.wait_write_io = wait_started_at.elapsed();
+            let write_started_at = Instant::now();
+            buffered
+                .write_with_transaction_profiled(
+                    target_format,
+                    &job.destination_file,
+                    profile_enabled.then_some(&mut transaction_profile),
                 )
-            })?;
-        }
+                .map_err(|error| {
+                    anyhow!(
+                        "failed to write {}: {error:#}",
+                        job.destination_file.display()
+                    )
+                })?;
+            write_started_at.elapsed()
+        };
         profile.encode_write = encode_write_started_at.elapsed();
         if let Some(encode_profile) = encode_profile {
             profile.encode_compress = encode_profile.compress;
-            profile.encode_file_write = encode_profile.file_write;
             profile.encoded_units = encode_profile.encoded_units;
             profile.raw_payload_bytes = encode_profile.raw_payload_bytes;
             profile.compressed_payload_bytes = encode_profile.compressed_payload_bytes;
         }
         if profile_enabled {
             profile.output_commit = transaction_profile.commit;
+            profile.encode_file_write = disk_write.saturating_sub(transaction_profile.commit);
             let accounted = profile
                 .encode_compress
                 .saturating_add(profile.encode_file_write)
-                .saturating_add(profile.output_commit);
+                .saturating_add(profile.output_commit)
+                .saturating_add(profile.wait_write_io);
             profile.encode_other_cpu = profile.encode_write.saturating_sub(accounted);
         }
         diagnostics.append(&mut encoded_diagnostics);

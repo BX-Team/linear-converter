@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -10,8 +10,12 @@ use crate::io::{
     commit_prepared_file, discard_prepared_file, prepare_atomic_write, prepare_temp_path,
 };
 
+/// The main region stream: the temp file when streaming, or an in-memory buffer.
+pub trait RegionOutput: Write + Seek {}
+impl<T: Write + Seek> RegionOutput for T {}
+
 pub trait RegionWriteTarget {
-    fn main_file(&mut self) -> &mut File;
+    fn main_file(&mut self) -> &mut dyn RegionOutput;
     fn write_sidecar_file(&mut self, file_name: &str, bytes: &[u8]) -> Result<()>;
 }
 
@@ -58,6 +62,47 @@ where
         profile.commit = commit_started_at.elapsed();
     }
     result
+}
+
+/// A region encoded fully in memory, so compression runs without holding an IO permit and
+/// only `write_with_transaction_profiled` touches the disk.
+#[derive(Default)]
+pub struct BufferedRegion {
+    main: Cursor<Vec<u8>>,
+    sidecars: Vec<(String, Vec<u8>)>,
+}
+
+impl BufferedRegion {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn write_with_transaction_profiled(
+        self,
+        target_format: RegionFormat,
+        destination_file: &Path,
+        profile: Option<&mut WriteTransactionProfile>,
+    ) -> Result<()> {
+        let main = self.main.into_inner();
+        write_region_with_transaction_profiled(target_format, destination_file, profile, |target| {
+            target.main_file().write_all(&main)?;
+            for (file_name, bytes) in &self.sidecars {
+                target.write_sidecar_file(file_name, bytes)?;
+            }
+            Ok(())
+        })
+    }
+}
+
+impl RegionWriteTarget for BufferedRegion {
+    fn main_file(&mut self) -> &mut dyn RegionOutput {
+        &mut self.main
+    }
+
+    fn write_sidecar_file(&mut self, file_name: &str, bytes: &[u8]) -> Result<()> {
+        self.sidecars.push((file_name.to_owned(), bytes.to_vec()));
+        Ok(())
+    }
 }
 
 struct StreamingOutputTransaction {
@@ -151,7 +196,7 @@ impl StreamingOutputTransaction {
 }
 
 impl RegionWriteTarget for StreamingOutputTransaction {
-    fn main_file(&mut self) -> &mut File {
+    fn main_file(&mut self) -> &mut dyn RegionOutput {
         &mut self.main_file
     }
 

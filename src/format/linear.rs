@@ -3,7 +3,6 @@
 //! recovery rules of the spec and writes fresh, compacted files of version 2.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 

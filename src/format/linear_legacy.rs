@@ -1,4 +1,4 @@
-use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{Cursor, Read, SeekFrom, Write};
 use std::path::Path;
 use std::time::Instant;
 
@@ -98,7 +98,7 @@ pub fn encode_region_to_writer_profiled(
     encode_modern_region_to_writer(region, compression_level, target, profile)
 }
 
-fn read_region_from_bytes(
+pub(crate) fn read_region_from_bytes(
     path: &Path,
     bytes: &[u8],
     storage_format: RegionStorageFormat,
